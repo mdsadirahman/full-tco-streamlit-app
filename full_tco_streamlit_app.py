@@ -1030,7 +1030,7 @@ def build_default_economic_inputs() -> Dict[str, Any]:
                 "annual_registration_usd_per_year": (880.0, 880.0),
                 "registration_weight_rate_usd_per_lb_year": (0.0, 0.0),
                 "empty_weight_lb": (0.0, 0.0),
-                "hvut_weight_rating_lb": (66000.0, 66000.0),
+                "hvut_weight_rating_lb": (80000.0, 80000.0),
                 "hvut_exempt_flag": (0.0, 0.0),
                 "permits_licenses_tolls_usd_per_mile": (0.0, 0.0),
                 "other_annual_fees_usd_per_year": (0.0, 0.0),
