@@ -7,7 +7,7 @@
 #   4) Drayage/Long Haul CNG are trial values copied from diesel inputs
 #   5) Sidebar inputs are grouped by selected application and vehicle type
 #   6) Breakeven uses exact diesel LCOD from same mother LCOD run
-# ============================================================
+# ===========================================================
 
 import copy
 import random
