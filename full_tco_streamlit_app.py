@@ -36,7 +36,7 @@ st.title("Full TCO Model")
 st.markdown(
     "Full TCO model (before and after tax benefit) for Refuse, Transit Bus, Drayage, and Long Haul. "
     "Basic LCOD app inputs are preserved for breakeven only; added economic, mileage-mode, and federal corporate tax-shield inputs are managed separately. Use the four case buttons to calculate and display one application at a time. "
-    "The optional Argonne/VIUS mileage mode uses approximate age-dependent mileage factors digitized from Argonne and scaled to the user-entered average annual mileage."
+    "The optional Argonne/VIUS (vehicle inventory and use survey) mileage mode uses approximate age-dependent mileage factors digitized from Argonne and scaled to the user-entered average annual mileage."
 )
 
 # ============================================================
