@@ -23,6 +23,7 @@ from io import BytesIO
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from matplotlib.ticker import FuncFormatter
 import streamlit as st
 
 # ============================================================
@@ -55,6 +56,12 @@ plt.rcParams.update({
     "legend.fontsize": FONT_LEGEND,
     "figure.titlesize": FONT_FIGURE,
 })
+
+
+def _format_dollars_millions(x, pos):
+    """Format total PV TCO axis values as dollar amounts in millions."""
+    return f"${x / 1_000_000:.1f}M"
+
 
 # ============================================================
 # TYPES AND CONSTANTS
@@ -146,7 +153,7 @@ FULL_TCO_LABELS = {
     "tax_fees": "Taxes & fees",
     "payload": "Payload",
     "labor": "Labor",
-    "federal_tax_benefit": "Federal tax benefit",
+    "federal_tax_benefit": "Federal tax benefit reduction",
 }
 
 # Explicit colors for component-stacked Full TCO bars
@@ -2075,13 +2082,16 @@ selected_vehicles_display = st.sidebar.multiselect(
     format_func=lambda x: x.upper(),
 )
 
-metric_display = st.sidebar.radio(
-    "Full TCO plot metric",
+metric_displays = st.sidebar.multiselect(
+    "Full TCO plot metrics to display",
     options=["$/mile", "Total PV TCO ($)", "$/ton-mile"],
-    index=0,
+    default=st.session_state.get("metric_displays", ["$/mile", "Total PV TCO ($)"]),
 )
 
-if metric_display == "$/ton-mile":
+if len(metric_displays) == 0:
+    st.sidebar.warning("Select at least one Full TCO plot metric.")
+
+if "$/ton-mile" in metric_displays:
     non_freight_selected = [app for app in selected_apps if app not in FREIGHT_TON_MILE_APPS]
     if non_freight_selected:
         st.sidebar.info(
@@ -2090,7 +2100,7 @@ if metric_display == "$/ton-mile":
         )
 
 tax_plot_display = st.sidebar.radio(
-    "Full TCO tax plots",
+    "Full TCO tax-benefit plots",
     options=["Show both", "Pre-tax only", "After-tax only"],
     index=0,
 )
@@ -2345,13 +2355,13 @@ def make_full_tco_stacked_plot_for_app(app_key: str, metric: str, tax_view: str 
         if tax_view == "after_tax":
             total_key = "after_tax_full_tco_total_pv"
             tax_key = "federal_tax_benefit_total_pv"
-            ylabel = "After-tax total PV TCO ($)"
+            ylabel = "After-tax Total PV TCO ($, millions)"
             file_label = "after_tax_total_pv"
             plot_label = "After-tax Total PV TCO"
         else:
             total_key = "full_tco_total_pv"
             tax_key = None
-            ylabel = "Pre-tax total PV TCO ($)"
+            ylabel = "Pre-tax Total PV TCO ($, millions)"
             file_label = "pre_tax_total_pv"
             plot_label = "Pre-tax Total PV TCO"
     else:
@@ -2454,6 +2464,11 @@ def make_full_tco_stacked_plot_for_app(app_key: str, metric: str, tax_view: str 
     ax.set_xticks(x)
     ax.set_xticklabels([_vehicle_pretty(v) for v in vehs])
     ax.set_ylabel(ylabel)
+    if metric == "Total PV TCO ($)":
+        # Avoid Matplotlib's small "1e6" offset text, which can make
+        # million-dollar TCO values look like small decimal numbers.
+        ax.yaxis.set_major_formatter(FuncFormatter(_format_dollars_millions))
+        ax.yaxis.offsetText.set_visible(False)
     ax.set_title(f"{res['label']}\n{plot_label} — {mode_label}\nMileage: {mileage_label}")
     ax.grid(axis="y", alpha=0.3)
 
@@ -2473,11 +2488,12 @@ def make_full_tco_stacked_plot_for_app(app_key: str, metric: str, tax_view: str 
 
 st.subheader("Full TCO Component Stacked Plots")
 st.markdown(
-    "For each selected application, the app can show the pre-tax and after-tax Full TCO plots. "
-    "Choose $/mile, total PV TCO ($), or $/ton-mile from the sidebar. "
+    "For each selected application, the app can show the before- and after-corporate-tax-benefit Full TCO plots. "
+    "You can select more than one metric from the sidebar: $/mile, total PV TCO ($), and $/ton-mile. "
+    "The Total PV TCO plot is an absolute dollar amount and is formatted in millions of dollars, for example $1.5M = $1,500,000. "
     "$/ton-mile plots are shown only for Drayage and Long Haul. "
-    "The after-tax plot keeps the same positive cost stack and adds a hatched negative Federal tax benefit segment. "
-    "The black error bar shows the selected total P5–P95."
+    "In the after-tax-benefit plot, the gray hatched segment is the federal tax-benefit reduction: "
+    "the top of the gray area corresponds to the before-benefit total, and the black marker/error bar corresponds to the after-benefit total P50/P5–P95."
 )
 
 plot_views = []
@@ -2486,36 +2502,51 @@ if tax_plot_display in ["Show both", "Pre-tax only"]:
 if tax_plot_display in ["Show both", "After-tax only"]:
     plot_views.append("after_tax")
 
-for app_key in selected_apps:
-    res = all_results[app_key]
+if len(metric_displays) == 0:
+    st.warning("Select at least one Full TCO plot metric in the sidebar.")
+else:
+    for metric_display in metric_displays:
+        st.markdown(f"## Full TCO plots — {metric_display}")
 
-    if metric_display == "$/ton-mile" and app_key not in FREIGHT_TON_MILE_APPS:
-        st.info(f"Skipping {res['label']} for $/ton-mile plots. Ton-mile plots are shown only for Drayage and Long Haul.")
-        continue
+        for app_key in selected_apps:
+            res = all_results[app_key]
 
-    for tax_view in plot_views:
-        fig_app, file_label, mode_label, plot_label = make_full_tco_stacked_plot_for_app(
-            app_key,
-            metric_display,
-            tax_view=tax_view,
-        )
+            if metric_display == "$/ton-mile" and app_key not in FREIGHT_TON_MILE_APPS:
+                st.info(f"Skipping {res['label']} for $/ton-mile plots. Ton-mile plots are shown only for Drayage and Long Haul.")
+                continue
 
-        st.markdown(f"### {res['label']} — {plot_label} — {mode_label}")
-        st.pyplot(fig_app)
+            for tax_view in plot_views:
+                fig_app, file_label, mode_label, plot_label = make_full_tco_stacked_plot_for_app(
+                    app_key,
+                    metric_display,
+                    tax_view=tax_view,
+                )
 
-        buf_app = BytesIO()
-        fig_app.savefig(buf_app, format="png", dpi=600, bbox_inches="tight")
-        buf_app.seek(0)
+                st.markdown(f"### {res['label']} — {plot_label} — {mode_label}")
+                st.pyplot(fig_app)
 
-        st.download_button(
-            label=f"Download {res['label']} {plot_label} stacked plot PNG, 600 dpi ({metric_display})",
-            data=buf_app,
-            file_name=f"full_tco_stacked_{app_key}_{mode_label.lower()}_{file_label}.png",
-            mime="image/png",
-            key=f"download_full_tco_plot_{app_key}_{file_label}_{mode_label}_{tax_view}",
-        )
+                buf_app = BytesIO()
+                fig_app.savefig(buf_app, format="png", dpi=600, bbox_inches="tight")
+                buf_app.seek(0)
 
-        plt.close(fig_app)
+                metric_clean = (
+                    metric_display.replace("$", "usd")
+                    .replace("/", "_per_")
+                    .replace(" ", "_")
+                    .replace("(", "")
+                    .replace(")", "")
+                    .replace("-", "_")
+                )
+
+                st.download_button(
+                    label=f"Download {res['label']} {plot_label} stacked plot PNG, 600 dpi ({metric_display})",
+                    data=buf_app,
+                    file_name=f"full_tco_stacked_{app_key}_{mode_label.lower()}_{file_label}.png",
+                    mime="image/png",
+                    key=f"download_full_tco_plot_{app_key}_{metric_clean}_{file_label}_{mode_label}_{tax_view}",
+                )
+
+                plt.close(fig_app)
 
 # ============================================================
 # ORIGINAL LCOD TABLE, KEPT FOR BREAKEVEN TRANSPARENCY ONLY
