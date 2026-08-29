@@ -7,6 +7,12 @@
 #   4) Drayage/Long Haul CNG are trial values copied from diesel inputs
 #   5) Sidebar inputs are grouped by selected application and vehicle type
 #   6) Breakeven uses exact diesel LCOD from same mother LCOD run
+#   7) Adds optional federal corporate tax-shield calculations and
+#      separate pre-tax / after-tax Full TCO plots
+#   8) Adds absolute total PV TCO plots and restricts ton-mile outputs
+#      to freight applications (Drayage and Long Haul)
+#   9) Adds two Full TCO mileage modes:
+#      constant annual mileage and approximate Argonne/VIUS age-dependent VMT
 # ============================================================
 
 import copy
@@ -25,7 +31,11 @@ import streamlit as st
 st.set_page_config(page_title="Full TCO Model", layout="wide")
 
 st.title("Full TCO Model")
-st.markdown("Argonne-style discounted Full TCO model for Refuse, Transit Bus, Drayage, and Long Haul. Existing LCOD app inputs are preserved; added economic inputs are managed separately.")
+st.markdown(
+    "Argonne-style discounted Full TCO model for Refuse, Transit Bus, Drayage, and Long Haul. "
+    "Existing LCOD app inputs are preserved; added economic, mileage-mode, and federal corporate tax-shield inputs are managed separately. "
+    "The optional Argonne/VIUS mileage mode uses approximate age-dependent mileage factors digitized from Argonne Figure 2.7 and scaled to the user-entered average annual mileage."
+)
 
 # ============================================================
 # PLOT STYLE
@@ -57,7 +67,52 @@ DEFAULT_RANDOM_SEED = 7
 PCTILES = (5, 50, 95)
 
 APP_ORDER = ["refuse", "bus", "drayage", "longhaul"]
+FREIGHT_TON_MILE_APPS = ["drayage", "longhaul"]
 VEHICLE_ORDER = ["diesel", "fcev", "bev", "cng"]
+
+# Mileage modes used only for the discounted Full TCO calculations.
+# The original LCOD/breakeven calculation is intentionally kept unchanged.
+MILEAGE_MODE_CONSTANT = "Constant annual mileage"
+MILEAGE_MODE_VIUS = "Argonne/VIUS approximate age-dependent mileage"
+MILEAGE_MODE_OPTIONS = [MILEAGE_MODE_CONSTANT, MILEAGE_MODE_VIUS]
+
+# Approximate year-by-year MHDV VMT schedules visually digitized from
+# Argonne ANL/ESD-21/4 Figure 2.7.  These are used as normalized shapes,
+# not as fixed absolute mileages: the code scales the curve so the user's
+# selected average annual mileage is preserved over the sampled lifetime.
+ARGONNE_VIUS_MHDV_VMT = {
+    # Our app's Long Haul maps to Argonne Tractor - Sleeper Cab.
+    "longhaul": [
+        108000.0, 120000.0, 114000.0, 105000.0, 92000.0,
+        80000.0, 72000.0, 64000.0, 56000.0, 50000.0,
+        44000.0, 39000.0, 35000.0, 31000.0, 27000.0,
+    ],
+    # Our app's Drayage maps to Argonne Tractor - Day Cab.
+    "drayage": [
+        74000.0, 73000.0, 72000.0, 68000.0, 60000.0,
+        53000.0, 47000.0, 42000.0, 38000.0, 34000.0,
+        30000.0, 27000.0, 24500.0, 22500.0, 20500.0,
+    ],
+    # Our app's Refuse maps to Argonne Class 8 Refuse.
+    "refuse": [
+        30000.0, 31000.0, 31000.0, 30000.0, 28000.0,
+        26500.0, 25000.0, 24000.0, 23500.0, 22500.0,
+        21000.0, 19500.0, 17500.0, 16000.0, 15000.0,
+    ],
+    # Our app's Transit Bus maps to Argonne Transit Bus.
+    "bus": [
+        23000.0, 38000.0, 42000.0, 42000.0, 41000.0,
+        39500.0, 39000.0, 39000.0, 39000.0, 38500.0,
+        38000.0, 38000.0, 37500.0, 37000.0, 36500.0,
+    ],
+}
+
+ARGONNE_VIUS_LABELS = {
+    "longhaul": "Argonne Tractor - Sleeper Cab",
+    "drayage": "Argonne Tractor - Day Cab",
+    "refuse": "Argonne Class 8 Refuse",
+    "bus": "Argonne Transit Bus",
+}
 
 VEHICLE_COLORS = {
     "diesel": "#4D4D4D",
@@ -80,6 +135,8 @@ FULL_TCO_COMPONENTS = [
     "labor",
 ]
 
+AFTER_TAX_COMPONENTS = FULL_TCO_COMPONENTS + ["federal_tax_benefit"]
+
 FULL_TCO_LABELS = {
     "vehicle": "Vehicle",
     "financing": "Financing",
@@ -89,6 +146,7 @@ FULL_TCO_LABELS = {
     "tax_fees": "Taxes & fees",
     "payload": "Payload",
     "labor": "Labor",
+    "federal_tax_benefit": "Federal tax benefit",
 }
 
 # Explicit colors for component-stacked Full TCO bars
@@ -101,6 +159,7 @@ FULL_TCO_COLORS = {
     "tax_fees": "#FFA600",     # bright orange
     "payload": "#FFD166",      # bright yellow
     "labor": "#FF3D8B",        # bright pink
+    "federal_tax_benefit": "#7F7F7F",  # gray tax-shield reduction
 }
 
 ECON_MODE_DEFAULT = "Use Argonne low-advancement default values"
@@ -209,6 +268,8 @@ def smart_econ_range_input(label: str, default_range: Range, key: str) -> Range:
         "down_payment_fraction",
         "sales_tax_fraction",
         "federal_excise_tax_fraction",
+        "corporate_tax_rate",
+        "tax_benefit_utilization_fraction",
     ]
     if label in percent_keys:
         return percent_range_input(label, default_range, key)
@@ -230,6 +291,8 @@ def economic_input_unit(key: str) -> str:
         "down_payment_fraction",
         "sales_tax_fraction",
         "federal_excise_tax_fraction",
+        "corporate_tax_rate",
+        "tax_benefit_utilization_fraction",
     }
     if key in percent_keys:
         return "%"
@@ -275,6 +338,8 @@ def economic_input_display_name(key: str) -> str:
         "payload_penalty_usd_per_mile": "Payload penalty",
         "fueling_or_charging_labor_usd_per_mile": "Fueling/charging labor",
         "annual_afv_registration_usd_per_year": "Annual AFV registration surcharge",
+        "corporate_tax_rate": "Federal corporate tax rate",
+        "tax_benefit_utilization_fraction": "Tax benefit utilization",
     }
     return label_map.get(key, key.replace("_", " ").title())
 
@@ -287,6 +352,8 @@ def format_econ_value(key: str, value: float) -> str:
         "down_payment_fraction",
         "sales_tax_fraction",
         "federal_excise_tax_fraction",
+        "corporate_tax_rate",
+        "tax_benefit_utilization_fraction",
     }
     if key in percent_keys:
         return f"{float(value) * 100.0:.4g}%"
@@ -941,6 +1008,11 @@ def build_default_economic_inputs() -> Dict[str, Any]:
         "loan_apr": (0.04, 0.04),
         "down_payment_fraction": (0.12, 0.12),
         "loan_term_years": (5.25, 5.25),
+        # Federal corporate income-tax shield settings.
+        # A 21% default is used for C corporations; utilization lets users
+        # model fleets that cannot use the full tax benefit immediately.
+        "corporate_tax_rate": (0.21, 0.21),
+        "tax_benefit_utilization_fraction": (1.0, 1.0),
     }
 
     def veh_payload(diesel=0.0, fcev=0.0, bev=0.0, cng=0.0):
@@ -1030,7 +1102,7 @@ def build_default_economic_inputs() -> Dict[str, Any]:
                 "annual_registration_usd_per_year": (880.0, 880.0),
                 "registration_weight_rate_usd_per_lb_year": (0.0, 0.0),
                 "empty_weight_lb": (0.0, 0.0),
-                "hvut_weight_rating_lb": (80000.0, 80000.0),
+                "hvut_weight_rating_lb": (66000.0, 66000.0),
                 "hvut_exempt_flag": (0.0, 0.0),
                 "permits_licenses_tolls_usd_per_mile": (0.0, 0.0),
                 "other_annual_fees_usd_per_year": (0.0, 0.0),
@@ -1091,6 +1163,100 @@ def discounted_annual_sum(annual_value: float, lifetime_years: float, discount_r
 
 def discounted_miles_sum(annual_miles: float, lifetime_years: float, discount_rate: float) -> float:
     return discounted_annual_sum(annual_miles, lifetime_years, discount_rate)
+
+
+def _schedule_length_for_life(lifetime_years: float) -> int:
+    """Number of calendar-year values needed, including a possible fractional final year."""
+    life = float(lifetime_years)
+    if life <= 0:
+        return 0
+    return int(np.ceil(life - 1e-12))
+
+
+def _extend_year_schedule(raw_values: list[float], n_years: int) -> list[float]:
+    """Return n_years values; repeat the final value if the requested life exceeds the table."""
+    if n_years <= 0:
+        return []
+    if not raw_values:
+        return [0.0] * n_years
+    values = [float(v) for v in raw_values]
+    if n_years <= len(values):
+        return values[:n_years]
+    return values + [values[-1]] * (n_years - len(values))
+
+
+def undiscounted_schedule_sum(annual_values: list[float], lifetime_years: float) -> float:
+    """Undiscounted sum of a year-by-year schedule with a fractional final year."""
+    life = float(lifetime_years)
+    full_years = int(np.floor(life))
+    frac = life - full_years
+
+    total = 0.0
+    for idx in range(full_years):
+        if idx < len(annual_values):
+            total += float(annual_values[idx])
+
+    if frac > 1e-12 and full_years < len(annual_values):
+        total += frac * float(annual_values[full_years])
+
+    return float(total)
+
+
+def discounted_schedule_sum(annual_values: list[float], lifetime_years: float, discount_rate: float) -> float:
+    """PV of a year-by-year annual value schedule with a fractional final year."""
+    life = float(lifetime_years)
+    full_years = int(np.floor(life))
+    frac = life - full_years
+
+    total = 0.0
+    for t in range(1, full_years + 1):
+        idx = t - 1
+        if idx < len(annual_values):
+            total += float(annual_values[idx]) * pv_factor(t, discount_rate)
+
+    if frac > 1e-12 and full_years < len(annual_values):
+        t = full_years + 1
+        total += frac * float(annual_values[full_years]) * pv_factor(t, discount_rate)
+
+    return float(total)
+
+
+def annual_miles_schedule(
+    app_key: str,
+    annual_miles: float,
+    lifetime_years: float,
+    mileage_mode: str,
+) -> list[float]:
+    """Create the annual-mile schedule used by Full TCO.
+
+    Constant mode repeats the user-entered annual mileage.
+    Argonne/VIUS mode uses the approximate Figure 2.7 VMT curve as a shape and
+    scales it so the user's selected average annual mileage is preserved over
+    the sampled lifetime.
+    """
+    n_years = _schedule_length_for_life(lifetime_years)
+    if n_years <= 0:
+        return []
+
+    user_annual = float(annual_miles)
+    if mileage_mode != MILEAGE_MODE_VIUS or app_key not in ARGONNE_VIUS_MHDV_VMT:
+        return [user_annual] * n_years
+
+    raw_schedule = _extend_year_schedule(ARGONNE_VIUS_MHDV_VMT[app_key], n_years)
+    raw_lifetime_miles = undiscounted_schedule_sum(raw_schedule, lifetime_years)
+    target_lifetime_miles = user_annual * float(lifetime_years)
+
+    if raw_lifetime_miles <= 0:
+        return [user_annual] * n_years
+
+    scale = target_lifetime_miles / raw_lifetime_miles
+    return [float(v) * scale for v in raw_schedule]
+
+
+def mileage_mode_detail(app_key: str, mileage_mode: str) -> str:
+    if mileage_mode == MILEAGE_MODE_VIUS:
+        return f"{MILEAGE_MODE_VIUS} ({ARGONNE_VIUS_LABELS.get(app_key, 'mapped MHDV schedule')})"
+    return MILEAGE_MODE_CONSTANT
 
 
 def hvut_annual_usd(weight_rating_lb: float, exempt_flag: float) -> float:
@@ -1198,7 +1364,94 @@ def pv_physical_damage_insurance(
     return float(total)
 
 
-def full_tco_components_per_mile(v, g, e, residual_cost: float, purchase_total: float) -> Dict[str, Any]:
+
+def clamp_fraction(value: float, lo: float = 0.0, hi: float = 1.0) -> float:
+    return float(min(max(float(value), lo), hi))
+
+
+def macrs_5yr_half_year_rates() -> list[float]:
+    """
+    Standard 5-year MACRS half-year-convention percentages.
+    The sixth entry appears because the half-year convention spreads recovery
+    over six tax years.
+    """
+    return [0.20, 0.32, 0.192, 0.1152, 0.1152, 0.0576]
+
+
+def pv_depreciation_tax_shield(
+    depreciable_basis: float,
+    lifetime_years: float,
+    discount_rate: float,
+    corporate_tax_rate: float,
+    utilization_fraction: float,
+) -> float:
+    """PV of tax benefit from 5-year MACRS depreciation.
+
+    Purchase cost is not deducted immediately here. Instead, the tax benefit
+    comes from depreciation deductions. If the modeled vehicle life ends before
+    all MACRS years are used, only deduction years inside the operating life are
+    counted.
+    """
+    rate = max(0.0, float(corporate_tax_rate))
+    util = clamp_fraction(utilization_fraction)
+    life = float(lifetime_years)
+
+    pv_tax = 0.0
+    for year, macrs_rate in enumerate(macrs_5yr_half_year_rates(), start=1):
+        if year - 1 >= life:
+            break
+        depreciation_deduction = float(depreciable_basis) * macrs_rate
+        pv_tax += depreciation_deduction * rate * util * pv_factor(year, discount_rate)
+
+    return float(pv_tax)
+
+
+def federal_tax_benefit_pv(
+    purchase_total: float,
+    financing_interest_pv: float,
+    deductible_operating_pv: float,
+    lifetime_years: float,
+    discount_rate: float,
+    corporate_tax_rate: float,
+    utilization_fraction: float,
+) -> Dict[str, float]:
+    """PV of federal corporate income-tax shields.
+
+    This treats recurring operating costs and loan interest as deductible and
+    treats vehicle purchase cost through depreciation, not as an immediate
+    full deduction.
+    """
+    rate = max(0.0, float(corporate_tax_rate))
+    util = clamp_fraction(utilization_fraction)
+
+    depreciation_tax_shield = pv_depreciation_tax_shield(
+        depreciable_basis=purchase_total,
+        lifetime_years=lifetime_years,
+        discount_rate=discount_rate,
+        corporate_tax_rate=rate,
+        utilization_fraction=util,
+    )
+    financing_tax_shield = float(financing_interest_pv) * rate * util
+    operating_tax_shield = float(deductible_operating_pv) * rate * util
+
+    total = depreciation_tax_shield + financing_tax_shield + operating_tax_shield
+
+    return {
+        "depreciation_tax_shield": float(depreciation_tax_shield),
+        "financing_tax_shield": float(financing_tax_shield),
+        "operating_tax_shield": float(operating_tax_shield),
+        "total_tax_benefit": float(total),
+    }
+
+def full_tco_components_per_mile(
+    v,
+    g,
+    e,
+    residual_cost: float,
+    purchase_total: float,
+    app_key: str,
+    mileage_mode: str,
+) -> Dict[str, Any]:
     """
     Full TCO LCOD = PV(all cost components) / PV(miles).
     Vehicle/fuel/maintenance inputs come from the original LCOD app.
@@ -1215,7 +1468,15 @@ def full_tco_components_per_mile(v, g, e, residual_cost: float, purchase_total: 
     if v["fuel_economy_mi_per_unit"] <= 0:
         raise ValueError("Fuel economy must be > 0.")
 
-    discounted_miles = discounted_miles_sum(annual_miles, lifetime_years, discount_rate)
+    miles_by_year = annual_miles_schedule(
+        app_key=app_key,
+        annual_miles=annual_miles,
+        lifetime_years=lifetime_years,
+        mileage_mode=mileage_mode,
+    )
+
+    discounted_miles = discounted_schedule_sum(miles_by_year, lifetime_years, discount_rate)
+    undiscounted_miles = undiscounted_schedule_sum(miles_by_year, lifetime_years)
     if discounted_miles <= 0:
         raise ValueError("Discounted miles must be > 0.")
 
@@ -1233,15 +1494,15 @@ def full_tco_components_per_mile(v, g, e, residual_cost: float, purchase_total: 
 
     # Fuel and maintenance from original LCOD app inputs.
     fuel_per_mile = v["fuel_price_usd_per_unit"] / v["fuel_economy_mi_per_unit"]
-    fuel_pv = discounted_annual_sum(
-        annual_value=fuel_per_mile * annual_miles,
+    fuel_pv = discounted_schedule_sum(
+        [fuel_per_mile * m for m in miles_by_year],
         lifetime_years=lifetime_years,
         discount_rate=discount_rate,
     )
 
     maintenance_per_mile = v["maintenance_usd_per_mile"]
-    maintenance_pv = discounted_annual_sum(
-        annual_value=maintenance_per_mile * annual_miles,
+    maintenance_pv = discounted_schedule_sum(
+        [maintenance_per_mile * m for m in miles_by_year],
         lifetime_years=lifetime_years,
         discount_rate=discount_rate,
     )
@@ -1252,8 +1513,8 @@ def full_tco_components_per_mile(v, g, e, residual_cost: float, purchase_total: 
         lifetime_years=lifetime_years,
         discount_rate=discount_rate,
     )
-    liability_insurance_pv = discounted_annual_sum(
-        annual_value=e["insurance_liability_usd_per_mile"] * annual_miles,
+    liability_insurance_pv = discounted_schedule_sum(
+        [e["insurance_liability_usd_per_mile"] * m for m in miles_by_year],
         lifetime_years=lifetime_years,
         discount_rate=discount_rate,
     )
@@ -1280,20 +1541,26 @@ def full_tco_components_per_mile(v, g, e, residual_cost: float, purchase_total: 
         + e["annual_afv_registration_usd_per_year"]
         + e["registration_weight_rate_usd_per_lb_year"] * e["empty_weight_lb"]
     )
-    annual_permits_tolls = e["permits_licenses_tolls_usd_per_mile"] * annual_miles
-    annual_tax_fees = hvut + annual_registration + annual_permits_tolls + e["other_annual_fees_usd_per_year"]
-    tax_fees_pv = upfront_tax_fees + discounted_annual_sum(annual_tax_fees, lifetime_years, discount_rate)
+    fixed_annual_tax_fees = hvut + annual_registration + e["other_annual_fees_usd_per_year"]
+    fixed_annual_tax_fees_pv = discounted_annual_sum(fixed_annual_tax_fees, lifetime_years, discount_rate)
+    permits_tolls_pv = discounted_schedule_sum(
+        [e["permits_licenses_tolls_usd_per_mile"] * m for m in miles_by_year],
+        lifetime_years=lifetime_years,
+        discount_rate=discount_rate,
+    )
+    annual_tax_fees_pv = fixed_annual_tax_fees_pv + permits_tolls_pv
+    tax_fees_pv = upfront_tax_fees + annual_tax_fees_pv
 
     # Payload penalty and labor.
-    payload_pv = discounted_annual_sum(
-        annual_value=e["payload_penalty_usd_per_mile"] * annual_miles,
+    payload_pv = discounted_schedule_sum(
+        [e["payload_penalty_usd_per_mile"] * m for m in miles_by_year],
         lifetime_years=lifetime_years,
         discount_rate=discount_rate,
     )
 
     labor_per_mile = e["driver_labor_usd_per_mile"] + e["fueling_or_charging_labor_usd_per_mile"]
-    labor_pv = discounted_annual_sum(
-        annual_value=labor_per_mile * annual_miles,
+    labor_pv = discounted_schedule_sum(
+        [labor_per_mile * m for m in miles_by_year],
         lifetime_years=lifetime_years,
         discount_rate=discount_rate,
     )
@@ -1312,11 +1579,41 @@ def full_tco_components_per_mile(v, g, e, residual_cost: float, purchase_total: 
     mile_components = {k: pv_components[k] / discounted_miles for k in FULL_TCO_COMPONENTS}
     total_mile = sum(mile_components.values())
 
+    # Federal corporate income-tax benefit.
+    # Operating deductions include recurring business costs and annual taxes/fees.
+    # Upfront vehicle purchase cost is handled through MACRS depreciation instead
+    # of being deducted immediately.
+    deductible_operating_pv = (
+        fuel_pv
+        + maintenance_pv
+        + insurance_pv
+        + annual_tax_fees_pv
+        + payload_pv
+        + labor_pv
+    )
+    tax_pv_components = federal_tax_benefit_pv(
+        purchase_total=purchase_total,
+        financing_interest_pv=financing_pv,
+        deductible_operating_pv=deductible_operating_pv,
+        lifetime_years=lifetime_years,
+        discount_rate=discount_rate,
+        corporate_tax_rate=e.get("corporate_tax_rate", 0.0),
+        utilization_fraction=e.get("tax_benefit_utilization_fraction", 0.0),
+    )
+
+    federal_tax_benefit = tax_pv_components["total_tax_benefit"]
+    after_tax_total_mile = total_mile - federal_tax_benefit / discounted_miles
+
     return {
         "pv_components": pv_components,
         "mile_components": mile_components,
         "total_mile": float(total_mile),
+        "tax_pv_components": tax_pv_components,
+        "federal_tax_benefit_pv": float(federal_tax_benefit),
+        "federal_tax_benefit_mile": float(federal_tax_benefit / discounted_miles),
+        "after_tax_total_mile": float(after_tax_total_mile),
         "discounted_miles": float(discounted_miles),
+        "undiscounted_miles": float(undiscounted_miles),
     }
 
 
@@ -1345,6 +1642,7 @@ def run_application_model(
     app_cfg: Dict[str, Any],
     econ_cfg: Dict[str, Any],
     econ_mode: str,
+    mileage_mode: str,
     n_samples: int,
     random_seed: int,
 ) -> Dict[str, Any]:
@@ -1366,6 +1664,7 @@ def run_application_model(
     # New Full TCO arrays.
     full_tco_mile = {vt: [] for vt in veh_list}
     full_tco_tm = {vt: [] for vt in veh_list}
+    full_tco_total_pv = {vt: [] for vt in veh_list}
     full_tco_component_mile = {
         vt: {comp: [] for comp in FULL_TCO_COMPONENTS}
         for vt in veh_list
@@ -1374,7 +1673,34 @@ def run_application_model(
         vt: {comp: [] for comp in FULL_TCO_COMPONENTS}
         for vt in veh_list
     }
+    full_tco_component_total_pv = {
+        vt: {comp: [] for comp in FULL_TCO_COMPONENTS}
+        for vt in veh_list
+    }
+    after_tax_full_tco_mile = {vt: [] for vt in veh_list}
+    after_tax_full_tco_tm = {vt: [] for vt in veh_list}
+    after_tax_full_tco_total_pv = {vt: [] for vt in veh_list}
+    federal_tax_benefit_mile = {vt: [] for vt in veh_list}
+    federal_tax_benefit_tm = {vt: [] for vt in veh_list}
+    federal_tax_benefit_total_pv = {vt: [] for vt in veh_list}
+    federal_tax_benefit_component_mile = {
+        vt: {
+            "depreciation_tax_shield": [],
+            "financing_tax_shield": [],
+            "operating_tax_shield": [],
+        }
+        for vt in veh_list
+    }
+    federal_tax_benefit_component_total_pv = {
+        vt: {
+            "depreciation_tax_shield": [],
+            "financing_tax_shield": [],
+            "operating_tax_shield": [],
+        }
+        for vt in veh_list
+    }
     discounted_miles = {vt: [] for vt in veh_list}
+    undiscounted_miles = {vt: [] for vt in veh_list}
 
     breakeven_inputs = {
         vt: {
@@ -1444,34 +1770,73 @@ def run_application_model(
                 e=e,
                 residual_cost=residual_cost,
                 purchase_total=comp["purchase_total"],
+                app_key=app_name,
+                mileage_mode=mileage_mode,
             )
 
             full_mile = full["total_mile"]
             full_tm = lcod_usd_per_ton_mile_point(full_mile, rev_wt)
+            full_total_pv = sum(full["pv_components"].values())
+
+            after_tax_mile = full["after_tax_total_mile"]
+            after_tax_tm = lcod_usd_per_ton_mile_point(after_tax_mile, rev_wt)
+            tax_benefit_mile = full["federal_tax_benefit_mile"]
+            tax_benefit_tm = lcod_usd_per_ton_mile_point(tax_benefit_mile, rev_wt)
+            tax_benefit_total_pv = full["federal_tax_benefit_pv"]
+            after_tax_total_pv = full_total_pv - tax_benefit_total_pv
 
             full_tco_mile[vt].append(full_mile)
             full_tco_tm[vt].append(full_tm)
+            full_tco_total_pv[vt].append(full_total_pv)
+            after_tax_full_tco_mile[vt].append(after_tax_mile)
+            after_tax_full_tco_tm[vt].append(after_tax_tm)
+            after_tax_full_tco_total_pv[vt].append(after_tax_total_pv)
+            federal_tax_benefit_mile[vt].append(tax_benefit_mile)
+            federal_tax_benefit_tm[vt].append(tax_benefit_tm)
+            federal_tax_benefit_total_pv[vt].append(tax_benefit_total_pv)
             discounted_miles[vt].append(full["discounted_miles"])
+            undiscounted_miles[vt].append(full["undiscounted_miles"])
 
             for cname in FULL_TCO_COMPONENTS:
                 c_mile = full["mile_components"][cname]
+                c_total_pv = full["pv_components"][cname]
                 full_tco_component_mile[vt][cname].append(c_mile)
                 full_tco_component_tm[vt][cname].append(c_mile / rev_wt)
+                full_tco_component_total_pv[vt][cname].append(c_total_pv)
+
+            for cname in federal_tax_benefit_component_mile[vt]:
+                c_total_pv = full["tax_pv_components"][cname]
+                c_mile = c_total_pv / full["discounted_miles"]
+                federal_tax_benefit_component_mile[vt][cname].append(c_mile)
+                federal_tax_benefit_component_total_pv[vt][cname].append(c_total_pv)
 
     return {
         "application": app_name,
         "label": app_cfg["label"],
         "economic_label": econ_cfg.get("label", "Economic inputs"),
         "economic_mode": econ_mode,
+        "mileage_mode": mileage_mode,
+        "mileage_mode_detail": mileage_mode_detail(app_name, mileage_mode),
         "VEH_LIST": veh_list,
         "lcod_mile": lcod_mile,
         "lcod_tm": lcod_tm,
         "breakeven_inputs": breakeven_inputs,
         "full_tco_mile": full_tco_mile,
         "full_tco_tm": full_tco_tm,
+        "full_tco_total_pv": full_tco_total_pv,
         "full_tco_component_mile": full_tco_component_mile,
         "full_tco_component_tm": full_tco_component_tm,
+        "full_tco_component_total_pv": full_tco_component_total_pv,
+        "after_tax_full_tco_mile": after_tax_full_tco_mile,
+        "after_tax_full_tco_tm": after_tax_full_tco_tm,
+        "after_tax_full_tco_total_pv": after_tax_full_tco_total_pv,
+        "federal_tax_benefit_mile": federal_tax_benefit_mile,
+        "federal_tax_benefit_tm": federal_tax_benefit_tm,
+        "federal_tax_benefit_total_pv": federal_tax_benefit_total_pv,
+        "federal_tax_benefit_component_mile": federal_tax_benefit_component_mile,
+        "federal_tax_benefit_component_total_pv": federal_tax_benefit_component_total_pv,
         "discounted_miles": discounted_miles,
+        "undiscounted_miles": undiscounted_miles,
     }
 
 
@@ -1484,12 +1849,39 @@ APPLICATIONS = copy.deepcopy(
 )
 
 DEFAULT_ECON_R = build_default_economic_inputs()
-ECON_R = copy.deepcopy(
-    st.session_state.get("ECON_R", DEFAULT_ECON_R)
+DEFAULT_ECON_MODE = {app_key: ECON_MODE_DEFAULT for app_key in APP_ORDER}
+
+
+def merge_missing_defaults(user_cfg: Dict[str, Any], default_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Preserve existing/custom values while adding new v7 default keys."""
+    merged = copy.deepcopy(default_cfg)
+
+    def _merge(dst, src):
+        for key, value in src.items():
+            if isinstance(value, dict) and isinstance(dst.get(key), dict):
+                _merge(dst[key], value)
+            else:
+                dst[key] = value
+
+    if isinstance(user_cfg, dict):
+        _merge(merged, user_cfg)
+    return merged
+
+
+# Draft economic inputs are the values currently shown/edited in the sidebar.
+# They are NOT used in the displayed results until the user presses Run Full TCO Model.
+PENDING_ECON_R = merge_missing_defaults(
+    st.session_state.get("PENDING_ECON_R", DEFAULT_ECON_R),
+    DEFAULT_ECON_R,
 )
-ECON_MODE = copy.deepcopy(
-    st.session_state.get("ECON_MODE", {app_key: ECON_MODE_DEFAULT for app_key in APP_ORDER})
+PENDING_ECON_MODE = merge_missing_defaults(
+    st.session_state.get("PENDING_ECON_MODE", DEFAULT_ECON_MODE),
+    DEFAULT_ECON_MODE,
 )
+
+# Local names used by the economic sidebar below. These are pending values only.
+ECON_R = copy.deepcopy(PENDING_ECON_R)
+ECON_MODE = copy.deepcopy(PENDING_ECON_MODE)
 
 # ============================================================
 # SIDEBAR APP SELECTOR FOR OLD LCOD INPUT EDITING
@@ -1526,6 +1918,22 @@ with st.sidebar.form("model_input_form"):
         "Random seed",
         value=int(st.session_state.get("RANDOM_SEED", DEFAULT_RANDOM_SEED)),
         step=1,
+    )
+
+    previous_mileage_mode = st.session_state.get("MILEAGE_MODE", MILEAGE_MODE_CONSTANT)
+    if previous_mileage_mode not in MILEAGE_MODE_OPTIONS:
+        previous_mileage_mode = MILEAGE_MODE_CONSTANT
+
+    MILEAGE_MODE = st.radio(
+        "Full TCO mileage method",
+        options=MILEAGE_MODE_OPTIONS,
+        index=MILEAGE_MODE_OPTIONS.index(previous_mileage_mode),
+        help=(
+            "Constant mode repeats the user-entered annual mileage. "
+            "Argonne/VIUS mode uses approximate year-by-year mileage shapes from Argonne Figure 2.7, "
+            "scaled to preserve the user-entered average annual mileage. "
+            "The original LCOD breakeven calculation is kept unchanged."
+        ),
     )
 
     st.markdown("---")
@@ -1579,7 +1987,8 @@ with st.sidebar:
     st.header("Economic and Other Inputs")
     st.caption(
         "Select default or custom economic inputs separately for each application. "
-        "Custom values are application-specific and do not change defaults for other applications."
+        "Custom values are application-specific and do not change defaults for other applications. "
+        "Changing these widgets only creates pending edits; results update only after pressing Run Full TCO Model."
     )
 
     for app_key in APP_ORDER:
@@ -1641,9 +2050,10 @@ with st.sidebar:
 
 
 
-# Save economic sidebar state immediately so custom values persist across reruns.
-st.session_state["ECON_R"] = copy.deepcopy(ECON_R)
-st.session_state["ECON_MODE"] = copy.deepcopy(ECON_MODE)
+# Save economic sidebar state as DRAFT/PENDING values only.
+# These edits persist across reruns but are not applied to results until Run is pressed.
+st.session_state["PENDING_ECON_R"] = copy.deepcopy(ECON_R)
+st.session_state["PENDING_ECON_MODE"] = copy.deepcopy(ECON_MODE)
 
 # ============================================================
 # SIDEBAR DISPLAY OPTIONS
@@ -1667,7 +2077,21 @@ selected_vehicles_display = st.sidebar.multiselect(
 
 metric_display = st.sidebar.radio(
     "Full TCO plot metric",
-    options=["$/mile", "$/ton-mile"],
+    options=["$/mile", "Total PV TCO ($)", "$/ton-mile"],
+    index=0,
+)
+
+if metric_display == "$/ton-mile":
+    non_freight_selected = [app for app in selected_apps if app not in FREIGHT_TON_MILE_APPS]
+    if non_freight_selected:
+        st.sidebar.info(
+            "$/ton-mile plots and table columns are shown only for Drayage and Long Haul. "
+            "Refuse and Transit Bus will be skipped for this metric."
+        )
+
+tax_plot_display = st.sidebar.radio(
+    "Full TCO tax plots",
+    options=["Show both", "Pre-tax only", "After-tax only"],
     index=0,
 )
 
@@ -1689,16 +2113,20 @@ if run_button:
                 app_cfg=APPLICATIONS[app_key],
                 econ_cfg=ECON_R[app_key],
                 econ_mode=ECON_MODE[app_key],
+                mileage_mode=MILEAGE_MODE,
                 n_samples=N_SAMPLES,
                 random_seed=RANDOM_SEED,
             )
 
         st.session_state["all_results"] = all_results
         st.session_state["APPLICATIONS"] = copy.deepcopy(APPLICATIONS)
-        st.session_state["ECON_R"] = copy.deepcopy(ECON_R)
-        st.session_state["ECON_MODE"] = copy.deepcopy(ECON_MODE)
+        # These are the active economic inputs used for the completed run.
+        st.session_state["ACTIVE_ECON_R"] = copy.deepcopy(ECON_R)
+        st.session_state["ACTIVE_ECON_MODE"] = copy.deepcopy(ECON_MODE)
         st.session_state["N_SAMPLES"] = int(N_SAMPLES)
         st.session_state["RANDOM_SEED"] = int(RANDOM_SEED)
+        st.session_state["MILEAGE_MODE"] = MILEAGE_MODE
+        st.session_state["LAST_RUN_MILEAGE_MODE"] = MILEAGE_MODE
         st.session_state["selected_apps"] = selected_apps
         st.session_state["selected_vehicles_display"] = selected_vehicles_display
         st.session_state["LAST_RUN_ECON_R"] = copy.deepcopy(ECON_R)
@@ -1715,9 +2143,28 @@ else:
         st.stop()
 
     all_results = st.session_state["all_results"]
+
+    old_result_format = any(
+        "after_tax_full_tco_mile" not in res
+        or "federal_tax_benefit_mile" not in res
+        or "full_tco_total_pv" not in res
+        or "after_tax_full_tco_total_pv" not in res
+        or "mileage_mode" not in res
+        or "undiscounted_miles" not in res
+        for res in all_results.values()
+    )
+    if old_result_format:
+        st.info(
+            "Previous results were generated by an older app version. "
+            "Click **Run Full TCO Model** to calculate the new pre-tax, after-tax, total PV TCO, and mileage-mode results."
+        )
+        st.stop()
+
     APPLICATIONS = st.session_state["APPLICATIONS"]
-    ECON_R = st.session_state["ECON_R"]
-    ECON_MODE = st.session_state["ECON_MODE"]
+
+    # Keep current sidebar economic values as pending edits.
+    # Do not replace them with last-run values here, otherwise the UI would lose custom edits.
+    # The displayed tables/plots below come from all_results, which remains from the last completed run.
 
     st.session_state["selected_apps"] = selected_apps
     st.session_state["selected_vehicles_display"] = selected_vehicles_display
@@ -1730,22 +2177,24 @@ st.success(
     "Full TCO results are loaded. Display filters and breakeven selectors can be changed without rerunning the Monte Carlo simulation."
 )
 
+loaded_mileage_modes = sorted({res.get("mileage_mode", MILEAGE_MODE_CONSTANT) for res in all_results.values()})
+st.info("Mileage method used in loaded Full TCO results: " + ", ".join(loaded_mileage_modes))
+
 pending_econ_changes = False
 if "LAST_RUN_ECON_R" in st.session_state and "LAST_RUN_ECON_MODE" in st.session_state:
     pending_econ_changes = (
-        st.session_state["LAST_RUN_ECON_R"] != ECON_R
-        or st.session_state["LAST_RUN_ECON_MODE"] != ECON_MODE
+        st.session_state.get("PENDING_ECON_R", DEFAULT_ECON_R) != st.session_state["LAST_RUN_ECON_R"]
+        or st.session_state.get("PENDING_ECON_MODE", DEFAULT_ECON_MODE) != st.session_state["LAST_RUN_ECON_MODE"]
     )
 
 if pending_econ_changes:
     st.warning(
-        "Economic input values have changed after the last model run. "
-        "The tables and plots below still show the previous run. Click **Run Full TCO Model** to apply the changes."
+        "Economic input values have been edited after the last completed model run. "
+        "The tables and plots below are frozen from the previous run. Click **Run Full TCO Model** to apply the pending edits."
     )
 else:
     st.info(
-        "Sidebar economic input edits will not recalculate the model automatically. "
-        "Click **Run Full TCO Model** whenever you want to apply new input values."
+        "Economic input edits are stored as pending values and will not be applied until you click **Run Full TCO Model**."
     )
 
 # ============================================================
@@ -1767,31 +2216,76 @@ for app_key in selected_apps:
             continue
 
         mile_s = _summarize_percentiles(np.array(res["full_tco_mile"][vt], dtype=float), PCTILES)
-        tm_s = _summarize_percentiles(np.array(res["full_tco_tm"][vt], dtype=float), PCTILES)
+        after_mile_s = _summarize_percentiles(np.array(res["after_tax_full_tco_mile"][vt], dtype=float), PCTILES)
+        tax_mile_s = _summarize_percentiles(np.array(res["federal_tax_benefit_mile"][vt], dtype=float), PCTILES)
+        total_s = _summarize_percentiles(np.array(res["full_tco_total_pv"][vt], dtype=float), PCTILES)
+        after_total_s = _summarize_percentiles(np.array(res["after_tax_full_tco_total_pv"][vt], dtype=float), PCTILES)
+        tax_total_s = _summarize_percentiles(np.array(res["federal_tax_benefit_total_pv"][vt], dtype=float), PCTILES)
+        discounted_miles_s = _summarize_percentiles(np.array(res["discounted_miles"][vt], dtype=float), PCTILES)
+        undiscounted_miles_s = _summarize_percentiles(np.array(res["undiscounted_miles"][vt], dtype=float), PCTILES)
 
         row = {
             "Application": res["label"],
             "Economic inputs": app_mode_label,
+            "Mileage method": res.get("mileage_mode", MILEAGE_MODE_CONSTANT),
             "Vehicle": vt.upper(),
-            "P5 Full TCO ($/mile)": mile_s["p5"],
-            "P50 Full TCO ($/mile)": mile_s["p50"],
-            "P95 Full TCO ($/mile)": mile_s["p95"],
-            "P5 Full TCO ($/ton-mile)": tm_s["p5"],
-            "P50 Full TCO ($/ton-mile)": tm_s["p50"],
-            "P95 Full TCO ($/ton-mile)": tm_s["p95"],
+            "P50 undiscounted miles": undiscounted_miles_s["p50"],
+            "P50 discounted miles": discounted_miles_s["p50"],
+            "P5 Pre-tax Full TCO ($/mile)": mile_s["p5"],
+            "P50 Pre-tax Full TCO ($/mile)": mile_s["p50"],
+            "P95 Pre-tax Full TCO ($/mile)": mile_s["p95"],
+            "P5 Federal tax benefit ($/mile)": tax_mile_s["p5"],
+            "P50 Federal tax benefit ($/mile)": tax_mile_s["p50"],
+            "P95 Federal tax benefit ($/mile)": tax_mile_s["p95"],
+            "P5 After-tax Full TCO ($/mile)": after_mile_s["p5"],
+            "P50 After-tax Full TCO ($/mile)": after_mile_s["p50"],
+            "P95 After-tax Full TCO ($/mile)": after_mile_s["p95"],
+            "P5 Pre-tax Total PV TCO ($)": total_s["p5"],
+            "P50 Pre-tax Total PV TCO ($)": total_s["p50"],
+            "P95 Pre-tax Total PV TCO ($)": total_s["p95"],
+            "P5 Federal tax benefit Total PV ($)": tax_total_s["p5"],
+            "P50 Federal tax benefit Total PV ($)": tax_total_s["p50"],
+            "P95 Federal tax benefit Total PV ($)": tax_total_s["p95"],
+            "P5 After-tax Total PV TCO ($)": after_total_s["p5"],
+            "P50 After-tax Total PV TCO ($)": after_total_s["p50"],
+            "P95 After-tax Total PV TCO ($)": after_total_s["p95"],
         }
+
+        if app_key in FREIGHT_TON_MILE_APPS:
+            tm_s = _summarize_percentiles(np.array(res["full_tco_tm"][vt], dtype=float), PCTILES)
+            after_tm_s = _summarize_percentiles(np.array(res["after_tax_full_tco_tm"][vt], dtype=float), PCTILES)
+            tax_tm_s = _summarize_percentiles(np.array(res["federal_tax_benefit_tm"][vt], dtype=float), PCTILES)
+            row.update({
+                "P5 Pre-tax Full TCO ($/ton-mile)": tm_s["p5"],
+                "P50 Pre-tax Full TCO ($/ton-mile)": tm_s["p50"],
+                "P95 Pre-tax Full TCO ($/ton-mile)": tm_s["p95"],
+                "P5 Federal tax benefit ($/ton-mile)": tax_tm_s["p5"],
+                "P50 Federal tax benefit ($/ton-mile)": tax_tm_s["p50"],
+                "P95 Federal tax benefit ($/ton-mile)": tax_tm_s["p95"],
+                "P5 After-tax Full TCO ($/ton-mile)": after_tm_s["p5"],
+                "P50 After-tax Full TCO ($/ton-mile)": after_tm_s["p50"],
+                "P95 After-tax Full TCO ($/ton-mile)": after_tm_s["p95"],
+            })
         rows.append(row)
         all_full_rows.append(row)
 
         c_row = {
             "Application": res["label"],
             "Economic inputs": app_mode_label,
+            "Mileage method": res.get("mileage_mode", MILEAGE_MODE_CONSTANT),
             "Vehicle": vt.upper(),
         }
         for cname in FULL_TCO_COMPONENTS:
             c_arr = np.array(res["full_tco_component_mile"][vt][cname], dtype=float)
+            c_total_arr = np.array(res["full_tco_component_total_pv"][vt][cname], dtype=float)
             c_row[f"P50 {FULL_TCO_LABELS[cname]} ($/mile)"] = np.percentile(c_arr, 50)
-        c_row["P50 Total Full TCO ($/mile)"] = mile_s["p50"]
+            c_row[f"P50 {FULL_TCO_LABELS[cname]} Total PV ($)"] = np.percentile(c_total_arr, 50)
+        c_row["P50 Federal tax benefit ($/mile)"] = tax_mile_s["p50"]
+        c_row["P50 Federal tax benefit Total PV ($)"] = tax_total_s["p50"]
+        c_row["P50 Pre-tax Full TCO ($/mile)"] = mile_s["p50"]
+        c_row["P50 After-tax Full TCO ($/mile)"] = after_mile_s["p50"]
+        c_row["P50 Pre-tax Total PV TCO ($)"] = total_s["p50"]
+        c_row["P50 After-tax Total PV TCO ($)"] = after_total_s["p50"]
         component_rows.append(c_row)
         all_component_rows.append(c_row)
 
@@ -1825,29 +2319,67 @@ if not component_summary_df.empty:
 # ============================================================
 # INDIVIDUAL STACKED FULL TCO PLOTS
 # ============================================================
-def make_full_tco_stacked_plot_for_app(app_key: str, metric: str):
-    """Create one stacked Full TCO plot for one application only."""
+def make_full_tco_stacked_plot_for_app(app_key: str, metric: str, tax_view: str = "pre_tax"):
+    """Create one stacked Full TCO plot for one application only.
+
+    tax_view = "pre_tax" shows current Full TCO.
+    tax_view = "after_tax" shows the same positive cost stack plus a negative
+    Federal tax benefit segment; the black error bar is the after-tax total.
+    """
     if metric == "$/mile":
-        total_key = "full_tco_mile"
         comp_key = "full_tco_component_mile"
-        ylabel = "Full TCO ($/mile)"
-        file_label = "mile"
+        if tax_view == "after_tax":
+            total_key = "after_tax_full_tco_mile"
+            tax_key = "federal_tax_benefit_mile"
+            ylabel = "After-tax Full TCO ($/mile)"
+            file_label = "after_tax_mile"
+            plot_label = "After-tax Full TCO"
+        else:
+            total_key = "full_tco_mile"
+            tax_key = None
+            ylabel = "Pre-tax Full TCO ($/mile)"
+            file_label = "pre_tax_mile"
+            plot_label = "Pre-tax Full TCO"
+    elif metric == "Total PV TCO ($)":
+        comp_key = "full_tco_component_total_pv"
+        if tax_view == "after_tax":
+            total_key = "after_tax_full_tco_total_pv"
+            tax_key = "federal_tax_benefit_total_pv"
+            ylabel = "After-tax total PV TCO ($)"
+            file_label = "after_tax_total_pv"
+            plot_label = "After-tax Total PV TCO"
+        else:
+            total_key = "full_tco_total_pv"
+            tax_key = None
+            ylabel = "Pre-tax total PV TCO ($)"
+            file_label = "pre_tax_total_pv"
+            plot_label = "Pre-tax Total PV TCO"
     else:
-        total_key = "full_tco_tm"
         comp_key = "full_tco_component_tm"
-        ylabel = "Full TCO ($/ton-mile)"
-        file_label = "ton_mile"
+        if tax_view == "after_tax":
+            total_key = "after_tax_full_tco_tm"
+            tax_key = "federal_tax_benefit_tm"
+            ylabel = "After-tax Full TCO ($/ton-mile)"
+            file_label = "after_tax_ton_mile"
+            plot_label = "After-tax Full TCO"
+        else:
+            total_key = "full_tco_tm"
+            tax_key = None
+            ylabel = "Pre-tax Full TCO ($/ton-mile)"
+            file_label = "pre_tax_ton_mile"
+            plot_label = "Pre-tax Full TCO"
 
     res = all_results[app_key]
     vehs = [vt for vt in res["VEH_LIST"] if vt in selected_vehicles_display]
     mode_label = econ_input_set_label(res["economic_mode"])
+    mileage_label = res.get("mileage_mode", MILEAGE_MODE_CONSTANT)
 
     fig, ax = plt.subplots(figsize=(8.2, 6.2))
 
     if len(vehs) == 0:
         ax.axis("off")
         ax.set_title(f"{res['label']}\nNo selected vehicles")
-        return fig, file_label, mode_label
+        return fig, file_label, mode_label, plot_label
 
     x = np.arange(len(vehs))
     bottoms = np.zeros(len(vehs))
@@ -1886,6 +2418,26 @@ def make_full_tco_stacked_plot_for_app(app_key: str, metric: str):
         )
         bottoms += vals
 
+    if tax_view == "after_tax" and tax_key is not None:
+        tax_vals = []
+        for vt in vehs:
+            tax_arr = np.array(res[tax_key][vt], dtype=float)
+            tax_vals.append(np.percentile(tax_arr, 50))
+        tax_vals = np.array(tax_vals)
+
+        ax.bar(
+            x,
+            -tax_vals,
+            bottom=bottoms,
+            label=FULL_TCO_LABELS["federal_tax_benefit"],
+            color=FULL_TCO_COLORS["federal_tax_benefit"],
+            edgecolor="black",
+            linewidth=0.7,
+            width=0.58,
+            alpha=1.0,
+            hatch="//",
+        )
+
     ax.errorbar(
         x,
         total_p50,
@@ -1902,7 +2454,7 @@ def make_full_tco_stacked_plot_for_app(app_key: str, metric: str):
     ax.set_xticks(x)
     ax.set_xticklabels([_vehicle_pretty(v) for v in vehs])
     ax.set_ylabel(ylabel)
-    ax.set_title(f"{res['label']}\n{mode_label}")
+    ax.set_title(f"{res['label']}\n{plot_label} — {mode_label}\nMileage: {mileage_label}")
     ax.grid(axis="y", alpha=0.3)
 
     handles, labels = ax.get_legend_handles_labels()
@@ -1916,35 +2468,54 @@ def make_full_tco_stacked_plot_for_app(app_key: str, metric: str):
     )
 
     fig.tight_layout(rect=[0, 0.13, 1, 1])
-    return fig, file_label, mode_label
+    return fig, file_label, mode_label, plot_label
 
 
 st.subheader("Full TCO Component Stacked Plots")
 st.markdown(
-    "Plots are shown individually for each selected application. Each stacked segment shows the P50 cost component. "
-    "The black error bar shows total Full TCO P5–P95. Application titles show whether economic inputs are Default or Customized."
+    "For each selected application, the app can show the pre-tax and after-tax Full TCO plots. "
+    "Choose $/mile, total PV TCO ($), or $/ton-mile from the sidebar. "
+    "$/ton-mile plots are shown only for Drayage and Long Haul. "
+    "The after-tax plot keeps the same positive cost stack and adds a hatched negative Federal tax benefit segment. "
+    "The black error bar shows the selected total P5–P95."
 )
+
+plot_views = []
+if tax_plot_display in ["Show both", "Pre-tax only"]:
+    plot_views.append("pre_tax")
+if tax_plot_display in ["Show both", "After-tax only"]:
+    plot_views.append("after_tax")
 
 for app_key in selected_apps:
     res = all_results[app_key]
-    fig_app, file_label, mode_label = make_full_tco_stacked_plot_for_app(app_key, metric_display)
 
-    st.markdown(f"### {res['label']} — {mode_label}")
-    st.pyplot(fig_app)
+    if metric_display == "$/ton-mile" and app_key not in FREIGHT_TON_MILE_APPS:
+        st.info(f"Skipping {res['label']} for $/ton-mile plots. Ton-mile plots are shown only for Drayage and Long Haul.")
+        continue
 
-    buf_app = BytesIO()
-    fig_app.savefig(buf_app, format="png", dpi=600, bbox_inches="tight")
-    buf_app.seek(0)
+    for tax_view in plot_views:
+        fig_app, file_label, mode_label, plot_label = make_full_tco_stacked_plot_for_app(
+            app_key,
+            metric_display,
+            tax_view=tax_view,
+        )
 
-    st.download_button(
-        label=f"Download {res['label']} stacked plot PNG, 600 dpi ({metric_display})",
-        data=buf_app,
-        file_name=f"full_tco_stacked_{app_key}_{mode_label.lower()}_{file_label}.png",
-        mime="image/png",
-        key=f"download_full_tco_plot_{app_key}_{file_label}_{mode_label}",
-    )
+        st.markdown(f"### {res['label']} — {plot_label} — {mode_label}")
+        st.pyplot(fig_app)
 
-    plt.close(fig_app)
+        buf_app = BytesIO()
+        fig_app.savefig(buf_app, format="png", dpi=600, bbox_inches="tight")
+        buf_app.seek(0)
+
+        st.download_button(
+            label=f"Download {res['label']} {plot_label} stacked plot PNG, 600 dpi ({metric_display})",
+            data=buf_app,
+            file_name=f"full_tco_stacked_{app_key}_{mode_label.lower()}_{file_label}.png",
+            mime="image/png",
+            key=f"download_full_tco_plot_{app_key}_{file_label}_{mode_label}_{tax_view}",
+        )
+
+        plt.close(fig_app)
 
 # ============================================================
 # ORIGINAL LCOD TABLE, KEPT FOR BREAKEVEN TRANSPARENCY ONLY
@@ -2075,6 +2646,7 @@ else:
 # FINAL NOTE
 # ============================================================
 st.info(
-    "Existing LCOD app inputs are preserved. Added economic inputs are separate and can be Default or Customized for each application. "
+    "Existing LCOD app inputs are preserved. Added economic and federal corporate tax-shield inputs are separate and can be Default or Customized for each application. "
+    "The app now reports and plots both pre-tax Full TCO and after-tax Full TCO. "
     "Breakeven uses the original LCOD formula only. Drayage and Long Haul CNG still use diesel-like trial parameters from the old app unless you replace them."
 )
