@@ -2,7 +2,7 @@
 # FULL TCO STREAMLIT APP
 # Full TCO Model version:
 #   1) No separate MDPI/Interactive modes in Streamlit
-#   2) Always runs all applications in fixed original order
+#   2) Uses four separate run buttons so only one application is calculated/displayed at a time
 #   3) CNG is included for Refuse, Transit Bus, Drayage, and Long Haul
 #   4) Drayage/Long Haul CNG are trial values copied from diesel inputs
 #   5) Sidebar inputs are grouped by selected application and vehicle type
@@ -13,6 +13,7 @@
 #      to freight applications (Drayage and Long Haul)
 #   9) Adds two Full TCO mileage modes:
 #      constant annual mileage and approximate Argonne/VIUS age-dependent VMT
+#  10) Reduces Streamlit load by running one selected case at a time
 # ============================================================
 
 import copy
@@ -33,7 +34,7 @@ st.set_page_config(page_title="Full TCO Model", layout="wide")
 st.title("Full TCO Model")
 st.markdown(
     "Argonne-style discounted Full TCO model for Refuse, Transit Bus, Drayage, and Long Haul. "
-    "Existing LCOD app inputs are preserved; added economic, mileage-mode, and federal corporate tax-shield inputs are managed separately. "
+    "Existing LCOD app inputs are preserved; added economic, mileage-mode, and federal corporate tax-shield inputs are managed separately. Use the four case buttons to calculate and display one application at a time. "
     "The optional Argonne/VIUS mileage mode uses approximate age-dependent mileage factors digitized from Argonne Figure 2.7 and scaled to the user-entered average annual mileage."
 )
 
@@ -397,10 +398,10 @@ def show_economic_values_table(econ_cfg: Dict[str, Any], title: str):
     app_df, veh_df = economic_tables_from_config(econ_cfg)
 
     st.caption("Application-level inputs")
-    st.dataframe(app_df, hide_index=True, use_container_width=True, height=260)
+    st.dataframe(app_df, hide_index=True, width="stretch", height=260)
 
     st.caption("Vehicle-specific inputs")
-    st.dataframe(veh_df, hide_index=True, use_container_width=True, height=260)
+    st.dataframe(veh_df, hide_index=True, width="stretch", height=260)
 
 # ============================================================
 # BASE APPLICATION DATA
@@ -1972,11 +1973,24 @@ with st.sidebar.form("model_input_form"):
                     )
 
     st.markdown("---")
-
-    run_button = st.form_submit_button(
-        "Run Full TCO Model",
-        use_container_width=True
+    st.markdown("### Run one application case")
+    st.caption(
+        "Only the clicked application is calculated and displayed. "
+        "This keeps the app lighter on Streamlit Cloud."
     )
+
+    run_app_buttons = {}
+    for _app_key in APP_ORDER:
+        run_app_buttons[_app_key] = st.form_submit_button(
+            f"Run {APPLICATIONS[_app_key]['label']} Case",
+            width="stretch",
+        )
+
+    run_app_key = next(
+        (_app_key for _app_key, _pressed in run_app_buttons.items() if _pressed),
+        None,
+    )
+    run_button = run_app_key is not None
 
 # ============================================================
 # ECONOMIC INPUTS OUTSIDE FORM
@@ -1988,7 +2002,7 @@ with st.sidebar:
     st.caption(
         "Select default or custom economic inputs separately for each application. "
         "Custom values are application-specific and do not change defaults for other applications. "
-        "Changing these widgets only creates pending edits; results update only after pressing Run Full TCO Model."
+        "Changing these widgets only creates pending edits; results update only after pressing a Run Case button."
     )
 
     for app_key in APP_ORDER:
@@ -2061,12 +2075,17 @@ st.session_state["PENDING_ECON_MODE"] = copy.deepcopy(ECON_MODE)
 st.sidebar.markdown("---")
 st.sidebar.header("Display Options")
 
-selected_apps = st.sidebar.multiselect(
-    "Applications to display",
-    options=APP_ORDER,
-    default=st.session_state.get("selected_apps", APP_ORDER),
-    format_func=lambda x: APPLICATIONS[x]["label"],
-)
+active_app_key_from_state = st.session_state.get("ACTIVE_APP_KEY", None)
+if active_app_key_from_state in APP_ORDER:
+    st.sidebar.info(
+        f"Active result: {APPLICATIONS[active_app_key_from_state]['label']}. "
+        "Click another case button to calculate and show a different application."
+    )
+else:
+    st.sidebar.info("No active result yet. Click one of the four Run Case buttons.")
+
+# The app now displays one active application at a time to reduce memory/load.
+selected_apps = [active_app_key_from_state] if active_app_key_from_state in APP_ORDER else []
 
 selected_vehicles_display = st.sidebar.multiselect(
     "Vehicles to display",
@@ -2075,19 +2094,27 @@ selected_vehicles_display = st.sidebar.multiselect(
     format_func=lambda x: x.upper(),
 )
 
-metric_display = st.sidebar.radio(
-    "Full TCO plot metric",
+metric_display_list = st.sidebar.multiselect(
+    "Full TCO plot metrics to display",
     options=["$/mile", "Total PV TCO ($)", "$/ton-mile"],
-    index=0,
+    default=st.session_state.get("metric_display_list", ["$/mile"]),
+    help=(
+        "You can select more than one metric, but plots are generated only for the active application case. "
+        "$/ton-mile is shown only for Drayage and Long Haul."
+    ),
 )
+if len(metric_display_list) == 0:
+    st.sidebar.warning("Select at least one plot metric to show Full TCO plots.")
 
-if metric_display == "$/ton-mile":
+if "$/ton-mile" in metric_display_list:
     non_freight_selected = [app for app in selected_apps if app not in FREIGHT_TON_MILE_APPS]
     if non_freight_selected:
         st.sidebar.info(
             "$/ton-mile plots and table columns are shown only for Drayage and Long Haul. "
             "Refuse and Transit Bus will be skipped for this metric."
         )
+
+st.session_state["metric_display_list"] = metric_display_list
 
 tax_plot_display = st.sidebar.radio(
     "Full TCO tax plots",
@@ -2100,25 +2127,30 @@ tax_plot_display = st.sidebar.radio(
 # ============================================================
 if run_button:
 
-    if len(selected_apps) == 0 or len(selected_vehicles_display) == 0:
-        st.warning("Select at least one application and one vehicle.")
+    if run_app_key not in APP_ORDER:
+        st.warning("Click one of the application case buttons to run the model.")
+        st.stop()
+
+    if len(selected_vehicles_display) == 0:
+        st.warning("Select at least one vehicle.")
         st.stop()
 
     all_results = {}
 
     try:
-        for app_key in APP_ORDER:
-            all_results[app_key] = run_application_model(
-                app_name=app_key,
-                app_cfg=APPLICATIONS[app_key],
-                econ_cfg=ECON_R[app_key],
-                econ_mode=ECON_MODE[app_key],
-                mileage_mode=MILEAGE_MODE,
-                n_samples=N_SAMPLES,
-                random_seed=RANDOM_SEED,
-            )
+        # Calculate only the clicked application. Other applications are not recalculated.
+        all_results[run_app_key] = run_application_model(
+            app_name=run_app_key,
+            app_cfg=APPLICATIONS[run_app_key],
+            econ_cfg=ECON_R[run_app_key],
+            econ_mode=ECON_MODE[run_app_key],
+            mileage_mode=MILEAGE_MODE,
+            n_samples=N_SAMPLES,
+            random_seed=RANDOM_SEED,
+        )
 
         st.session_state["all_results"] = all_results
+        st.session_state["ACTIVE_APP_KEY"] = run_app_key
         st.session_state["APPLICATIONS"] = copy.deepcopy(APPLICATIONS)
         # These are the active economic inputs used for the completed run.
         st.session_state["ACTIVE_ECON_R"] = copy.deepcopy(ECON_R)
@@ -2127,10 +2159,12 @@ if run_button:
         st.session_state["RANDOM_SEED"] = int(RANDOM_SEED)
         st.session_state["MILEAGE_MODE"] = MILEAGE_MODE
         st.session_state["LAST_RUN_MILEAGE_MODE"] = MILEAGE_MODE
-        st.session_state["selected_apps"] = selected_apps
+        st.session_state["selected_apps"] = [run_app_key]
         st.session_state["selected_vehicles_display"] = selected_vehicles_display
         st.session_state["LAST_RUN_ECON_R"] = copy.deepcopy(ECON_R)
         st.session_state["LAST_RUN_ECON_MODE"] = copy.deepcopy(ECON_MODE)
+
+        selected_apps = [run_app_key]
 
     except Exception as e:
         st.error(f"Model error: {e}")
@@ -2139,7 +2173,7 @@ if run_button:
 else:
 
     if "all_results" not in st.session_state:
-        st.info("Adjust sidebar inputs and click **Run Full TCO Model** to calculate results.")
+        st.info("Adjust sidebar inputs and click one of the four **Run Case** buttons to calculate results.")
         st.stop()
 
     all_results = st.session_state["all_results"]
@@ -2156,7 +2190,7 @@ else:
     if old_result_format:
         st.info(
             "Previous results were generated by an older app version. "
-            "Click **Run Full TCO Model** to calculate the new pre-tax, after-tax, total PV TCO, and mileage-mode results."
+            "Click one of the four **Run Case** buttons to calculate the new pre-tax, after-tax, total PV TCO, and mileage-mode results."
         )
         st.stop()
 
@@ -2166,15 +2200,27 @@ else:
     # Do not replace them with last-run values here, otherwise the UI would lose custom edits.
     # The displayed tables/plots below come from all_results, which remains from the last completed run.
 
+    active_app_key = st.session_state.get("ACTIVE_APP_KEY", None)
+    if active_app_key not in all_results:
+        if len(all_results) > 0:
+            active_app_key = next(iter(all_results.keys()))
+            st.session_state["ACTIVE_APP_KEY"] = active_app_key
+        else:
+            st.info("Click one of the four **Run Case** buttons to calculate results.")
+            st.stop()
+
+    selected_apps = [active_app_key]
     st.session_state["selected_apps"] = selected_apps
     st.session_state["selected_vehicles_display"] = selected_vehicles_display
 
 if len(selected_apps) == 0 or len(selected_vehicles_display) == 0:
-    st.warning("Select at least one application and one vehicle.")
+    st.warning("Select at least one vehicle and run one application case.")
     st.stop()
 
+active_label = APPLICATIONS[selected_apps[0]]["label"]
 st.success(
-    "Full TCO results are loaded. Display filters and breakeven selectors can be changed without rerunning the Monte Carlo simulation."
+    f"Full TCO results are loaded for {active_label}. "
+    "Display filters and breakeven selectors can be changed without rerunning the Monte Carlo simulation."
 )
 
 loaded_mileage_modes = sorted({res.get("mileage_mode", MILEAGE_MODE_CONSTANT) for res in all_results.values()})
@@ -2190,11 +2236,11 @@ if "LAST_RUN_ECON_R" in st.session_state and "LAST_RUN_ECON_MODE" in st.session_
 if pending_econ_changes:
     st.warning(
         "Economic input values have been edited after the last completed model run. "
-        "The tables and plots below are frozen from the previous run. Click **Run Full TCO Model** to apply the pending edits."
+        "The tables and plots below are frozen from the previous run. Click the relevant **Run Case** button to apply the pending edits."
     )
 else:
     st.info(
-        "Economic input edits are stored as pending values and will not be applied until you click **Run Full TCO Model**."
+        "Economic input edits are stored as pending values and will not be applied until you click a **Run Case** button."
     )
 
 # ============================================================
@@ -2291,9 +2337,9 @@ for app_key in selected_apps:
 
     st.markdown(f"### {res['label']} — {app_mode_label}")
     if rows:
-        st.dataframe(pd.DataFrame(rows), use_container_width=True)
+        st.dataframe(pd.DataFrame(rows), width="stretch")
         with st.expander(f"{res['label']} — P50 component breakdown ($/mile)", expanded=False):
-            st.dataframe(pd.DataFrame(component_rows), use_container_width=True)
+            st.dataframe(pd.DataFrame(component_rows), width="stretch")
     else:
         st.info("No selected vehicles available for this application.")
 
@@ -2473,8 +2519,8 @@ def make_full_tco_stacked_plot_for_app(app_key: str, metric: str, tax_view: str 
 
 st.subheader("Full TCO Component Stacked Plots")
 st.markdown(
-    "For each selected application, the app can show the pre-tax and after-tax Full TCO plots. "
-    "Choose $/mile, total PV TCO ($), or $/ton-mile from the sidebar. "
+    "The app now plots only the active application case to reduce Streamlit Cloud load. "
+    "You can still select more than one plot metric in the sidebar. "
     "$/ton-mile plots are shown only for Drayage and Long Haul. "
     "The after-tax plot keeps the same positive cost stack and adds a hatched negative Federal tax benefit segment. "
     "The black error bar shows the selected total P5–P95."
@@ -2486,36 +2532,43 @@ if tax_plot_display in ["Show both", "Pre-tax only"]:
 if tax_plot_display in ["Show both", "After-tax only"]:
     plot_views.append("after_tax")
 
-for app_key in selected_apps:
-    res = all_results[app_key]
+if len(metric_display_list) == 0:
+    st.warning("No Full TCO plot metric selected. Select at least one metric in the sidebar.")
+else:
+    for app_key in selected_apps:
+        res = all_results[app_key]
 
-    if metric_display == "$/ton-mile" and app_key not in FREIGHT_TON_MILE_APPS:
-        st.info(f"Skipping {res['label']} for $/ton-mile plots. Ton-mile plots are shown only for Drayage and Long Haul.")
-        continue
+        for metric_display in metric_display_list:
+            if metric_display == "$/ton-mile" and app_key not in FREIGHT_TON_MILE_APPS:
+                st.info(
+                    f"Skipping {res['label']} for $/ton-mile plots. "
+                    "Ton-mile plots are shown only for Drayage and Long Haul."
+                )
+                continue
 
-    for tax_view in plot_views:
-        fig_app, file_label, mode_label, plot_label = make_full_tco_stacked_plot_for_app(
-            app_key,
-            metric_display,
-            tax_view=tax_view,
-        )
+            for tax_view in plot_views:
+                fig_app, file_label, mode_label, plot_label = make_full_tco_stacked_plot_for_app(
+                    app_key,
+                    metric_display,
+                    tax_view=tax_view,
+                )
 
-        st.markdown(f"### {res['label']} — {plot_label} — {mode_label}")
-        st.pyplot(fig_app)
+                st.markdown(f"### {res['label']} — {plot_label} — {mode_label}")
+                st.pyplot(fig_app)
 
-        buf_app = BytesIO()
-        fig_app.savefig(buf_app, format="png", dpi=600, bbox_inches="tight")
-        buf_app.seek(0)
+                buf_app = BytesIO()
+                fig_app.savefig(buf_app, format="png", dpi=600, bbox_inches="tight")
+                buf_app.seek(0)
 
-        st.download_button(
-            label=f"Download {res['label']} {plot_label} stacked plot PNG, 600 dpi ({metric_display})",
-            data=buf_app,
-            file_name=f"full_tco_stacked_{app_key}_{mode_label.lower()}_{file_label}.png",
-            mime="image/png",
-            key=f"download_full_tco_plot_{app_key}_{file_label}_{mode_label}_{tax_view}",
-        )
+                st.download_button(
+                    label=f"Download {res['label']} {plot_label} stacked plot PNG, 600 dpi ({metric_display})",
+                    data=buf_app,
+                    file_name=f"full_tco_stacked_{app_key}_{mode_label.lower()}_{file_label}.png",
+                    mime="image/png",
+                    key=f"download_full_tco_plot_{app_key}_{file_label}_{mode_label}_{tax_view}_{metric_display}",
+                )
 
-        plt.close(fig_app)
+                plt.close(fig_app)
 
 # ============================================================
 # ORIGINAL LCOD TABLE, KEPT FOR BREAKEVEN TRANSPARENCY ONLY
@@ -2540,7 +2593,7 @@ with st.expander("Original LCOD summary used for breakeven only", expanded=False
                 "P95 original LCOD ($/ton-mile)": tm_s["p95"],
             })
     if old_rows:
-        st.dataframe(pd.DataFrame(old_rows), use_container_width=True)
+        st.dataframe(pd.DataFrame(old_rows), width="stretch")
     else:
         st.info("No original LCOD rows to display.")
 
@@ -2633,7 +2686,7 @@ else:
     ])
 
     st.markdown("### Breakeven Summary Table")
-    st.dataframe(be_table, use_container_width=True)
+    st.dataframe(be_table, width="stretch")
 
     st.download_button(
         label="Download breakeven summary as CSV",
