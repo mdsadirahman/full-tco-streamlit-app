@@ -24,6 +24,7 @@ from io import BytesIO
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from matplotlib.ticker import FuncFormatter
 import streamlit as st
 
 # ============================================================
@@ -76,6 +77,19 @@ VEHICLE_ORDER = ["diesel", "fcev", "bev", "cng"]
 MILEAGE_MODE_CONSTANT = "Constant annual mileage"
 MILEAGE_MODE_VIUS = "Argonne/VIUS approximate age-dependent mileage"
 MILEAGE_MODE_OPTIONS = [MILEAGE_MODE_CONSTANT, MILEAGE_MODE_VIUS]
+
+
+def _format_dollar_axis_millions(value, pos=None):
+    """Format large dollar axis values without Matplotlib scientific notation."""
+    if not np.isfinite(value):
+        return ""
+    abs_value = abs(value)
+    sign = "-" if value < 0 else ""
+    if abs_value >= 1_000_000:
+        return f"{sign}${abs_value / 1_000_000:.1f}M"
+    if abs_value >= 1_000:
+        return f"{sign}${abs_value / 1_000:.0f}k"
+    return f"{sign}${abs_value:.0f}"
 
 # Approximate year-by-year MHDV VMT schedules visually digitized from
 # Argonne ANL/ESD-21/4 Figure 2.7.  These are used as normalized shapes,
@@ -2502,6 +2516,10 @@ def make_full_tco_stacked_plot_for_app(app_key: str, metric: str, tax_view: str 
     ax.set_ylabel(ylabel)
     ax.set_title(f"{res['label']}\n{plot_label} — {mode_label}\nMileage: {mileage_label}")
     ax.grid(axis="y", alpha=0.3)
+
+    if metric == "Total PV TCO ($)":
+        ax.yaxis.set_major_formatter(FuncFormatter(_format_dollar_axis_millions))
+        ax.yaxis.get_offset_text().set_visible(False)
 
     handles, labels = ax.get_legend_handles_labels()
     fig.legend(
