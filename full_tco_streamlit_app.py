@@ -2459,7 +2459,7 @@ def make_full_tco_stacked_plot_for_app(app_key: str, metric: str, tax_view: str 
     total_p50 = np.array(total_p50)
     total_p95 = np.array(total_p95)
 
-        for cname in FULL_TCO_COMPONENTS:
+    for cname in FULL_TCO_COMPONENTS:
         vals = []
         for vt in vehs:
             c_arr = np.array(res[comp_key][vt][cname], dtype=float)
@@ -2481,7 +2481,7 @@ def make_full_tco_stacked_plot_for_app(app_key: str, metric: str, tax_view: str 
                 alpha=1.0,
             )
 
-        bottoms += vals
+    bottoms += vals
 
     if tax_view == "after_tax" and tax_key is not None:
         tax_vals = []
