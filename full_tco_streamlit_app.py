@@ -2380,6 +2380,7 @@ if not component_summary_df.empty:
 # ============================================================
 # INDIVIDUAL STACKED FULL TCO PLOTS
 # ============================================================
+
 def make_full_tco_stacked_plot_for_app(app_key: str, metric: str, tax_view: str = "pre_tax"):
     """Create one stacked Full TCO plot for one application only.
 
@@ -2401,6 +2402,7 @@ def make_full_tco_stacked_plot_for_app(app_key: str, metric: str, tax_view: str 
             ylabel = "Pre-tax Full TCO ($/mile)"
             file_label = "pre_tax_mile"
             plot_label = "Pre-tax Full TCO"
+
     elif metric == "Total PV TCO ($)":
         comp_key = "full_tco_component_total_pv"
         if tax_view == "after_tax":
@@ -2415,6 +2417,7 @@ def make_full_tco_stacked_plot_for_app(app_key: str, metric: str, tax_view: str 
             ylabel = "Pre-tax total PV TCO ($)"
             file_label = "pre_tax_total_pv"
             plot_label = "Pre-tax Total PV TCO"
+
     else:
         comp_key = "full_tco_component_tm"
         if tax_view == "after_tax":
@@ -2466,21 +2469,22 @@ def make_full_tco_stacked_plot_for_app(app_key: str, metric: str, tax_view: str 
             vals.append(np.percentile(c_arr, 50))
         vals = np.array(vals)
 
-        ax.bar(
-            x,
-            vals,
-            bottom=bottoms,
-            label=FULL_TCO_LABELS[cname],
-            color=FULL_TCO_COLORS[cname],
-            edgecolor="black",
-            linewidth=0.7,
-            width=0.58,
-            alpha=1.0,
-        )
+        mask = np.isfinite(vals) & (vals > 1e-9)
+
+        if np.any(mask):
+            ax.bar(
+                x[mask],
+                vals[mask],
+                bottom=bottoms[mask],
+                label=FULL_TCO_LABELS[cname],
+                color=FULL_TCO_COLORS[cname],
+                edgecolor="black",
+                linewidth=0.7,
+                width=0.58,
+                alpha=1.0,
+            )
 
         bottoms += vals
-
-    if tax_view == "after_tax" and tax_key is not None:
 
     if tax_view == "after_tax" and tax_key is not None:
         tax_vals = []
@@ -2513,6 +2517,7 @@ def make_full_tco_stacked_plot_for_app(app_key: str, metric: str, tax_view: str 
         capthick=1.5,
         zorder=10,
     )
+
     ax.scatter(x, total_p50, color="black", s=30, zorder=11)
 
     ax.set_xticks(x)
@@ -2534,6 +2539,9 @@ def make_full_tco_stacked_plot_for_app(app_key: str, metric: str, tax_view: str 
         bbox_to_anchor=(0.5, -0.02),
         frameon=False,
     )
+
+    fig.tight_layout(rect=[0, 0.13, 1, 1])
+    return fig, file_label, mode_label, plot_label
 
     fig.tight_layout(rect=[0, 0.13, 1, 1])
     return fig, file_label, mode_label, plot_label
