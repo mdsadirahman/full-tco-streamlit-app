@@ -2466,22 +2466,21 @@ def make_full_tco_stacked_plot_for_app(app_key: str, metric: str, tax_view: str 
             vals.append(np.percentile(c_arr, 50))
         vals = np.array(vals)
 
-        mask = vals > 1e-9
-
-        if np.any(mask):
-            ax.bar(
-                x[mask],
-                vals[mask],
-                bottom=bottoms[mask],
-                label=FULL_TCO_LABELS[cname],
-                color=FULL_TCO_COLORS[cname],
-                edgecolor="black",
-                linewidth=0.7,
-                width=0.58,
-                alpha=1.0,
-            )
+        ax.bar(
+            x,
+            vals,
+            bottom=bottoms,
+            label=FULL_TCO_LABELS[cname],
+            color=FULL_TCO_COLORS[cname],
+            edgecolor="black",
+            linewidth=0.7,
+            width=0.58,
+            alpha=1.0,
+        )
 
     bottoms += vals
+
+    if tax_view == "after_tax" and tax_key is not None:
 
     if tax_view == "after_tax" and tax_key is not None:
         tax_vals = []
