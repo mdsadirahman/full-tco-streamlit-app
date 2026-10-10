@@ -2459,24 +2459,28 @@ def make_full_tco_stacked_plot_for_app(app_key: str, metric: str, tax_view: str 
     total_p50 = np.array(total_p50)
     total_p95 = np.array(total_p95)
 
-    for cname in FULL_TCO_COMPONENTS:
+        for cname in FULL_TCO_COMPONENTS:
         vals = []
         for vt in vehs:
             c_arr = np.array(res[comp_key][vt][cname], dtype=float)
             vals.append(np.percentile(c_arr, 50))
         vals = np.array(vals)
 
-        ax.bar(
-            x,
-            vals,
-            bottom=bottoms,
-            label=FULL_TCO_LABELS[cname],
-            color=FULL_TCO_COLORS[cname],
-            edgecolor="black",
-            linewidth=0.7,
-            width=0.58,
-            alpha=1.0,
-        )
+        mask = vals > 1e-9
+
+        if np.any(mask):
+            ax.bar(
+                x[mask],
+                vals[mask],
+                bottom=bottoms[mask],
+                label=FULL_TCO_LABELS[cname],
+                color=FULL_TCO_COLORS[cname],
+                edgecolor="black",
+                linewidth=0.7,
+                width=0.58,
+                alpha=1.0,
+            )
+
         bottoms += vals
 
     if tax_view == "after_tax" and tax_key is not None:
