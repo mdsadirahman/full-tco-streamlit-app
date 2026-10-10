@@ -2478,7 +2478,7 @@ def make_full_tco_stacked_plot_for_app(app_key: str, metric: str, tax_view: str 
             alpha=1.0,
         )
 
-    bottoms += vals
+     bottoms += vals
 
     if tax_view == "after_tax" and tax_key is not None:
 
